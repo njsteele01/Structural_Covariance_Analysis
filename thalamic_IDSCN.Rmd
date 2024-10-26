@@ -1,0 +1,373 @@
+# Load packages and initialize functions
+```{r}
+library(dplyr)
+library(broom)  
+library(stats)
+
+
+df <- read.csv("your_data.csv")
+
+# optionally filter to only include subjects with valid data for variable of interest
+df <- df %>% filter(!is.na(clustEperc))
+
+
+#outliers +-2.689 SD for each of the brain regions should be already removed
+
+```
+
+
+# Create group dataframes
+```{r Create group dataframes}
+edge_order <- c("LeftPuI", "RightPuI", "LeftPuL", "RightPuL", 
+                "LeftPuA", "RightPuA", "LeftPuM", "RightPuM",
+                "LeftMGN", "RightMGN", "LeftLSg", "RightLSg",
+                 "LeftLGN", "RightLGN",
+
+                "LeftVPL", "RightVPL", 
+                "LeftVLa", "RightVLa", "LeftVLp", "RightVLp",
+                "LeftVM", "RightVM",
+                "LeftVA", "RightVA", "LeftVAmc", "RightVAmc", 
+
+                "LeftLP", "RightLP", "LeftLD", "RightLD", 
+                "LeftCL", "RightCL", "LeftPc", "RightPc", 
+                "LeftPf", "RightPf", "LeftCM", "RightCM",
+                
+                "LeftMDl", "RightMDl",
+                "LeftMDm", "RightMDm", "LeftRe", "RightRe",
+                 "LeftCeM", "RightCeM", "LeftPt", "RightPt",
+                "LeftAV", "RightAV")
+
+df_brain <- df %>%
+  {
+    if ("R_bankssts" %in% names(.)) {
+      select(., R_bankssts:L_insula, all_of(edge_order))
+    } else if ("Left.Caudate" %in% names(.)) {
+      select(., Left.Caudate:Right.Amygdala, all_of(edge_order))
+    } else {
+      select(., all_of(edge_order))
+    }
+  }
+
+df_var <- df[, c(1:17)] # Change based on number of non-brain variables in df
+df <- cbind(df_var, df_brain)
+
+all_brain_data <- df %>%
+  {
+    if ("R_bankssts" %in% names(.)) {
+      select(., R_bankssts:RightAV)
+    } else if ("Left.Caudate" %in% names(.)) {
+      select(., Left.Caudate:RightAV)
+    } else {
+      select(., LeftPuI:RightAV)
+    }
+  }
+
+all_brain_names <- names(all_brain_data)
+
+ptsd_group <- df %>% filter(ptsd_dx == 1)
+ptsd_group_data <- ptsd_group %>% select(all_of(all_brain_names))
+
+control_ptsd_group <- df %>% filter(ptsd_dx == 0)
+control_ptsd_group_data <- control_ptsd_group %>% select(all_of(all_brain_names))
+
+# create analysis-specific variables
+num_subjects <- nrow(ptsd_group_data)
+num_nodes <- ncol(ptsd_group_data)
+```
+
+# Create IDSCN
+```{r}
+# Create group SCNs
+control_matrix <- cor(control_ptsd_group_data) # control group SCN
+ptsd_matrix <- cor(ptsd_group_data) # PTSD group SCN
+
+
+# Edit based on which network is being analyzed
+#filt_control_matrix <- control_matrix[1:68, 69:118] # Thalamo-Cortical
+#filt_control_matrix <- control_matrix[1:12, 13:62] # Thalamo-Subcortical
+filt_control_matrix <- control_matrix # Intra-Thalamic
+
+
+# Create IDSCNs and convert to Z-scores ----------------------
+
+row_names <- rownames(control_matrix)
+subject_matrices <- array(NA, dim = c(nrow(control_matrix), ncol(control_matrix), num_subjects))
+z_score_matrices <- array(NA, dim = c(nrow(control_matrix), ncol(control_matrix), num_subjects))
+n <- nrow(control_ptsd_group_data)
+
+# Loop through each subject
+for (row in 1:num_subjects) {
+  # Combine current subject's data with the control group
+  n1_group <- rbind(ptsd_group_data[row, ], control_ptsd_group_data)
+
+  # Calculate the covariance matrix with the added subject
+  n1_matrix <- cor(n1_group)
+  
+  # Calculate the difference matrix (ΔSCN)
+  n1_diff_matrix <- n1_matrix - control_matrix
+  
+  # Calculate Z-scores using the provided formula
+  z_scores <- n1_diff_matrix / ((1 - control_matrix^2) / (n - 1))
+  diag(z_scores) <- 0
+  
+  # Store the Z-scores in the array
+  z_score_matrices[, , row] <- z_scores
+  subject_matrices[, , row] <- n1_diff_matrix
+}
+
+# Ensure correct matrix dimension names are applied
+dimnames(z_score_matrices) <- list(row_names, row_names, NULL)
+dimnames(subject_matrices) <- list(row_names, row_names, NULL)
+
+```
+
+
+```{r}
+# Remove intra-thalamic and intra-sub/cortical connections
+
+# Thalamo-Cortical Network
+z_score_matrices[1:68, 1:68, ] <- NA
+z_score_matrices[69:118, 69:118, ] <- NA
+
+subject_matrices[1:68, 1:68, ] <- NA
+subject_matrices[69:118, 69:118, ] <- NA
+
+
+# Thalamo-Subcortical Network
+z_score_matrices[1:12, 1:12, ] <- NA
+z_score_matrices[13:62, 13:62, ] <- NA
+
+subject_matrices[1:12, 1:12, ] <- NA
+subject_matrices[13:62, 13:62, ] <- NA
+
+```
+
+# Correlation analysis between IDSCN edges and PTSD severity measures
+```{r}
+
+mean_IDSCN <- array(NA, dim = c(num_nodes, num_nodes))
+mean_z_IDSCN <- array(NA, dim = c(num_nodes, num_nodes))
+
+results_df <- data.frame(
+  Row = character(),
+  Column = character(),
+  Mean_Pertubation = numeric(),
+  Correlation = numeric(),
+  P_Value = numeric(),
+  stringsAsFactors = FALSE
+)
+
+### Run correlation analysis by looping through all pairs of nodes ###
+for (i in 1:num_nodes) {
+  for (j in i:num_nodes) {
+    if (i !=j & !is.na(z_score_matrices[i, j, 1])) {
+      # Extract the correlation list for the current pair
+      mean_z_IDSCN[i, j] <- mean(z_score_matrices[i, j, ])
+      mean_IDSCN[i, j] <- mean(subject_matrices[i, j, ])
+      cor_list <- as.vector(z_score_matrices[i, j, ])
+      #df for linear regression
+      cor_df <- data.frame(edges = cor_list,
+                           clustE =  ptsd_group$clustEperc,
+                           clustB = ptsd_group$clustBperc,
+                           clustC = ptsd_group$clustCperc,
+                           clustD = ptsd_group$clustDperc,
+                           #mdd = ptsd_group$mdd_percent,
+                           ptsd = ptsd_group$PTSD_percent,
+                           age = ptsd_group$Age,
+                           sex = ptsd_group$Sex)
+      
+      # Perform correlation test
+      cor_test <- cor.test(cor_list, ptsd_group$clustEperc) # correlation analysis
+      #cor_test <- lm(edges ~ ptsd + sex + poly(age, 2), dat = cor_df) # linear regression
+
+      # Store results in the data frame
+     results_df <- results_df %>%
+        add_row(
+          Column = row_names[i],  
+          Row = row_names[j],  
+          Mean_Pertubation = mean_z_IDSCN[i,j],
+          #Correlation = summary(cor_test)$coefficients["ptsd", "Estimate"], # for linear regression
+          #P_Value = summary(cor_test)$coefficients["ptsd", "Pr(>|t|)"], # for linear regression
+          Correlation = cor_test$estimate, # for correlation
+          P_Value = cor_test$p.value # for correlation
+         )
+    }
+  }
+}
+
+### FDR correction of p-values ###
+
+# Optionally filter df to only include nodes with significantly altered centrality
+results_df <- results_df %>% filter(Row %in% central_intrathal) %>% 
+  filter(Column %in% central_intrathal)
+results_df <- results_df %>% filter(Row %in% c(central_intrathal))
+
+# Apply FDR correction
+results_df$FDR_P_Value <- p.adjust(results_df$P_Value, method = "fdr")
+results_df <- results_df %>% arrange(P_Value)
+
+
+```
+
+
+# Convert Z-score matrices to p-value matrices and FDR-correct
+```{r}
+# Assuming z_score_matrices is already calculated and contains Z-scores for each subject
+# Initialize an array to store p-values and FDR-corrected p-values for each subject's Z-score matrix
+n_rows <- nrow(filt_control_matrix)
+n_cols <- ncol(filt_control_matrix)
+filt_row_names <- rownames(filt_control_matrix)
+filt_col_names <- colnames(filt_control_matrix)
+p_value_matrices <- array(NA, dim = c(n_rows, n_cols, num_subjects))
+fdr_p_value_matrices <- array(NA, dim = c(n_rows, n_cols, num_subjects))
+
+
+# Loop through each subject to calculate p-values from Z-scores and apply FDR correction
+for (row in 1:num_subjects) {
+  
+  # Extract the Z-score matrix for the current subject 
+  z_score_matrix <- z_score_matrices[, , row] # Intra-Thalamic
+  #z_score_matrix <- z_score_matrices[69:118, 1:68, row] # Thalamo-Cortical
+  #z_score_matrix <- z_score_matrices[13:62, 1:12, row] # Thalamo-Subcortical
+
+  # Calculate p-values for each element in the Z-score matrix
+  p_value_matrix <- 2* pnorm(abs(z_score_matrix), lower.tail = FALSE)
+  
+  # Flatten the matrix to a vector for FDR correction
+  p_values_vector <- as.vector(p_value_matrix)
+  
+  # Apply FDR correction to the p-values
+  fdr_p_values_vector <- p.adjust(p_values_vector, method = "fdr")
+  
+  # Reshape the FDR-corrected p-values back to the original matrix dimensions
+  fdr_p_value_matrix <- matrix(fdr_p_values_vector, nrow = n_rows, ncol = n_cols)
+  
+  # Store the p-value matrix and the FDR-corrected p-value matrix
+  p_value_matrices[, , row] <- p_value_matrix
+  fdr_p_value_matrices[, , row] <- fdr_p_value_matrix
+}
+
+dimnames(fdr_p_value_matrices)[[1]] <- filt_row_names
+dimnames(fdr_p_value_matrices)[[2]] <- filt_col_names
+
+```
+
+
+# Find the number of significant edges
+```{r}
+# Define the significance threshold for identifying significant edges
+significance_threshold <- 0.05
+
+# Initialize a matrix to count the number of subjects with significant altered edges for each edge
+significant_counts <- matrix(0, nrow = n_rows, n_cols)
+
+# Loop through each edge (i.e., each pair of rows and columns)
+for (i in 1:n_rows) {
+  for (j in 1:n_cols) {
+    # Extract the p-values for the current edge across all subjects
+    p_values_for_edge <- fdr_p_value_matrices[i, j, ]
+    
+    # Count the number of subjects with a p-value less than the significance threshold
+    significant_counts[i, j] <- sum(p_values_for_edge < significance_threshold, na.rm = TRUE)
+    
+  }
+}
+colnames(significant_counts) <- colnames(filt_control_matrix)
+rownames(significant_counts) <- rownames(filt_control_matrix)
+
+# Convert the matrix to a data frame
+edge_ranking_df <- as.data.frame(as.table(significant_counts))
+
+# Rank the edges by the number of subjects with significant alterations
+edge_ranking_df <- edge_ranking_df[order(-edge_ranking_df$Freq), ]
+
+```
+
+
+# Correlations with total number of altered edges in IDSCNs
+```{r}
+
+# Loop through ROWS of array (e.g., thalamic nuclei)
+subj_altered_edges_per_node <- matrix(NA, nrow = num_subjects, ncol = n_cols)
+for (j in 1:n_cols) {
+  for (k in 1:num_subjects) {
+    # Count the number of values less than 0.05 in the matrix for each subject and column
+    curr_subj_altered_edges_per_node <- sum(fdr_p_value_matrices[, j, k] < 0.05)
+    subj_altered_edges_per_node[k, j] <- curr_subj_altered_edges_per_node
+  }
+}
+colnames(subj_altered_edges_per_node) <- colnames(filt_control_matrix)
+
+# Loop through COLUMNS of array (e.g., cortical brian regions)
+subj_altered_edges_per_node <- matrix(NA, nrow = num_subjects, ncol = n_rows)
+for (j in 1:n_rows) {
+  for (k in 1:num_subjects) {
+    # Count the number of values less than 0.05 in the matrix for each subject and column
+    curr_subj_altered_edges_per_node <- sum(fdr_p_value_matrices[j, , k] < 0.05)
+    subj_altered_edges_per_node[k, j] <- curr_subj_altered_edges_per_node
+  }
+}
+colnames(subj_altered_edges_per_node) <- rownames(filt_control_matrix)
+
+# Find number of altered edges per node summed across all PTSD subjects
+degree_counts <- colSums(subj_altered_edges_per_node)
+degree_counts <- data.frame(degree_counts, row.names = NULL)
+rownames(degree_counts) <- colnames(subj_altered_edges_per_node)
+
+
+### Find number of altered edges per IDSCN ###
+subj_total_altered_edges <- rowSums(subj_altered_edges_per_node) %>% as.data.frame()
+colnames(subj_total_altered_edges) <- "total"
+
+# Add clinical data to df
+subj_altered_edges_per_node_vars <- cbind(ptsd_group[, 1:17], subj_altered_edges_per_node)
+subj_total_altered_edges_vars <- cbind(ptsd_group[, 1:17], subj_total_altered_edges)
+
+
+
+### Correlate number of altered edges per node across IDSCNs with clinical variables ###
+
+clinical_var <- c("PTSD_percent") # clinical variable to correlate with number of altered edges per node
+
+results <- data.frame()
+for (col in colnames(subj_altered_edges_per_node)) {
+  # Perform correlation test
+  test_result <- cor.test(subj_altered_edges_per_node[, col], ptsd_group[[clinical_var]])
+
+  # Add results to the data frame
+  results <- rbind(results, data.frame(
+    column = col,
+    cluster = cluster,
+    correlation = test_result$estimate,
+    p_value = test_result$p.value
+  ))
+  
+}
+# Apply FDR correction
+results$fdr_p <- p.adjust(results$p_value, method = "fdr")
+results <- results %>% arrange(p_value)
+
+
+
+### Correlate total number of altered edges per IDSCN with clinical variables ###
+valid_data <- subj_total_altered_edges_vars %>% filter(!is.na(total) & !is.na(depression_percent))
+cor.test(valid_data$total, valid_data$depression_percent) # correlation analysis
+summary(lm(total ~ depression_percent + Sex + poly(Age, 2), valid_data)) # linear regression
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
