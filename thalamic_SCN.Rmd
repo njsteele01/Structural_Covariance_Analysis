@@ -1,0 +1,965 @@
+
+#########################
+#Intra-Thalamic Analysis#
+#########################
+
+# Load packages and initialize functions
+```{r Initialize functions, warning=FALSE}
+library(dplyr)
+library(ggplot2) 
+library(tidyr)
+library(reshape2)
+library(circlize)
+library(ggthemes)
+
+# Initialize functions
+num_edges_list <- c(0, 0.025, 0.05, 0.075, 0.1, 0.125, 0.15, 0.175, 
+                    0.2, 0.225, 0.25, 0.275, 0.3, 0.325, 0.35, 0.375, 0.4)
+
+equal_thresholding_of_matrix <- function(matrix) {
+  num_edges_list <- c()
+  graph_list <- list()
+  threshold_values <- c(0, 0.025, 0.05, 0.075, 0.1, 0.125, 0.15, 0.175, 
+                    0.2, 0.225, 0.25, 0.275, 0.3, 0.325, 0.35, 0.375, 0.4)
+  for (i in threshold_values) {
+    
+    matrix[matrix < i] <- 0
+    graph <- graph_from_adjacency_matrix(matrix, mode = "undirected", weighted = TRUE, diag = FALSE)
+    graph_list[[length(graph_list) + 1]] <- graph
+  }
+  return(graph_list)
+}
+
+graph_metrics_across_densities <- function(graph_list) {
+  
+  glob_eff_list <- numeric(length(graph_list))
+  avg_str_list <- numeric(length(graph_list))
+  mod_list <- numeric(length(graph_list))
+  
+  
+  for (i in 1:length(graph_list)) {
+    inv_graph <- graph_list[[i]]
+    E(inv_graph)$weight <- 1 / E(inv_graph)$weight
+    
+    glob_eff_list[i] <- efficiency(inv_graph, type = "global")
+    avg_str_list[i] <- mean(strength(graph_list[[i]], mode = "all"))
+    
+    community <- cluster_louvain(graph_list[[i]])
+    membership <- membership(community)
+    mod_list[i] <- modularity(graph_list[[i]],
+                              membership = membership,
+                              weights = E(graph_list[[i]])$weight)
+  }
+  graph_metrics_list <- c(list(glob_eff_list), list(avg_str_list), list(mod_list))
+                          
+  return(graph_metrics_list)
+}
+
+node_metrics_across_densities <- function(graph_list) {
+  num_nodes <- vcount(graph_list[[1]]) 
+  num_graphs <- length(graph_list)
+  num_measures <- 4
+  
+  graph_metrics_list <- array(NA, dim = c(num_nodes, num_graphs, num_measures))
+  
+  node_str_list <- list()
+  close_cen_list <- list()
+  eigen_cen_list <- list()
+  btwn_cen_list <- list()
+
+  for (i in 1:num_graphs) {
+    inv_graph <- graph_list[[i]]
+    E(inv_graph)$weight <- 1 / E(inv_graph)$weight
+
+    node_str_list[[i]] <- strength(graph_list[[i]], mode = "all")
+    close_cen_list[[i]] <- closeness(inv_graph, mode = "all")
+    eigen_cen_list[[i]] <- eigen_centrality(graph_list[[i]])$vector
+    btwn_cen_list[[i]] <- betweenness(inv_graph, directed = FALSE, 
+                            weights = inv_graph$weight)
+
+  }
+  
+  # Convert lists to matrices
+  node_str_matrix <- do.call(cbind, lapply(node_str_list, as.numeric))
+  close_cen_matrix <- do.call(cbind, lapply(close_cen_list, as.numeric))
+  eigen_cen_matrix <- do.call(cbind, lapply(eigen_cen_list, as.numeric))
+  btwn_cen_matrix <- do.call(cbind, lapply(btwn_cen_list, as.numeric))
+ 
+  # Reshape matrices to fit the array dimensions
+  for (i in 1:num_graphs) {
+    graph_metrics_list[,i,1] <- matrix(node_str_matrix[,i], nrow = num_nodes)
+    graph_metrics_list[,i,2] <- matrix(close_cen_matrix[,i], nrow = num_nodes)
+    graph_metrics_list[,i,3] <- matrix(eigen_cen_matrix[,i], nrow = num_nodes)
+    graph_metrics_list[,i,4] <- matrix(btwn_cen_matrix[,i], nrow = num_nodes)
+
+  }
+  return(graph_metrics_list)
+}
+
+permutation_test_edge_level <- function(n_permutations = 100000, brain_var = all_brain_names) {
+  
+  num_nodes <- length(brain_var)
+  perm_edge_diff_matrices <- array(NA, dim = c(num_nodes, num_nodes, n_permutations))
+  
+  for (perm in 1:n_permutations) {
+    
+    perm_df <- df
+    shuffled_labels <- sample(perm_df$ptsd_dx, replace = FALSE)
+    perm_df$ptsd_dx <- shuffled_labels
+    perm_ptsd_data <- perm_df %>% filter(ptsd_dx == 1) %>% select(all_of(brain_var))
+    perm_control_ptsd_data <- perm_df %>% filter(ptsd_dx == 0) %>% select(all_of(brain_var))
+    
+    perm_ptsd_matrix <- cor(perm_ptsd_data)
+    perm_control_ptsd_matrix <- cor(perm_control_ptsd_data)
+    
+    perm_edge_diff_matrix <- perm_ptsd_matrix - perm_control_ptsd_matrix
+    perm_edge_diff_matrices[,,perm] <- perm_edge_diff_matrix
+    
+    if (perm %% 2000 == 0) {
+      print(paste("Permutation", perm, "completed")) }
+  }
+  return(perm_edge_diff_matrices)
+}
+
+permutation_test_graph_level <- function(n_permutations = 5000, brain_var = all_brain_names) {
+  
+  num_graph_results <- 3
+  
+  perm_GE_diff_matrices <- array(NA, dim = c(length(num_edges_list), n_permutations))
+  perm_str_diff_matrices <- array(NA, dim = c(length(num_edges_list), n_permutations))
+  perm_mod_diff_matrices <- array(NA, dim = c(length(num_edges_list), n_permutations))
+
+  perm_diff_results <- array(NA, dim = c(length(num_edges_list), n_permutations, num_graph_results))
+
+  for (perm in 1:n_permutations) {
+  
+    perm_df <- df
+    shuffled_labels <- sample(perm_df$ptsd_dx, replace = FALSE)
+    perm_df$ptsd_dx <- shuffled_labels
+    perm_ptsd_data <- perm_df %>% filter(ptsd_dx == 1) %>% select(all_of(brain_var))
+    perm_control_ptsd_data <- perm_df %>% filter(ptsd_dx == 0) %>% select(all_of(brain_var))
+    
+    perm_ptsd_matrix <- abs(cor(perm_ptsd_data))
+    perm_control_ptsd_matrix <- abs(cor(perm_control_ptsd_data))
+
+    perm_ptsd_graph_list <- equal_thresholding_of_matrix(perm_ptsd_matrix)
+    perm_control_ptsd_graph_list <- equal_thresholding_of_matrix(perm_control_ptsd_matrix)
+    
+    perm_ptsd_metrics <- graph_metrics_across_densities(perm_ptsd_graph_list)
+    perm_control_ptsd_metrics <- graph_metrics_across_densities(perm_control_ptsd_graph_list)
+    
+    perm_GE_diff_matrices[, perm] <- perm_ptsd_metrics[[1]] - perm_control_ptsd_metrics[[1]]
+    perm_str_diff_matrices[, perm] <- perm_ptsd_metrics[[2]] - perm_control_ptsd_metrics[[2]]
+    perm_mod_diff_matrices[, perm] <- perm_ptsd_metrics[[3]] - perm_control_ptsd_metrics[[3]]
+
+    
+    if (perm %% 1 == 0) {
+       cat(".") }
+    if (perm %% 100 == 0) {
+      cat("\n")
+      print(paste("Permutation", perm, "completed")) }
+  }
+  perm_diff_results[,,1] <- perm_GE_diff_matrices
+  perm_diff_results[,,2] <- perm_str_diff_matrices
+  perm_diff_results[,,3] <- perm_mod_diff_matrices
+
+  return(perm_diff_results)
+}
+
+
+permutation_test_node_level <- function(n_permutations = 1000, brain_var = all_brain_names) {
+  
+  num_nodes <- length(brain_var)
+  num_graphs <- length(num_edges_list)
+  num_results <- 4
+  
+  perm_diff_results <- array(NA, dim = c(num_nodes, num_graphs, n_permutations, num_results))
+  
+  for (perm in 1:n_permutations) {
+    
+    perm_df <- df
+    shuffled_labels <- sample(perm_df$ptsd_dx, replace = FALSE)
+    perm_df$ptsd_dx <- shuffled_labels
+    perm_ptsd_data <- perm_df %>% filter(ptsd_dx == 1) %>% select(all_of(brain_var))
+    perm_control_ptsd_data <- perm_df %>% filter(ptsd_dx == 0) %>% select(all_of(brain_var))
+    
+    perm_ptsd_matrix <- abs(cor(perm_ptsd_data))
+    perm_control_ptsd_matrix <- abs(cor(perm_control_ptsd_data))
+    
+    perm_ptsd_graph_list <- equal_thresholding_of_matrix(perm_ptsd_matrix)
+    perm_control_ptsd_graph_list <- equal_thresholding_of_matrix(perm_control_ptsd_matrix)
+    
+    perm_ptsd_metrics <- node_metrics_across_densities(perm_ptsd_graph_list)
+    perm_control_ptsd_metrics <- node_metrics_across_densities(perm_control_ptsd_graph_list)
+    
+    perm_diff_results[, , perm ,] <- perm_ptsd_metrics - perm_control_ptsd_metrics
+    
+    if (perm %% 1 == 0) {
+       cat(".") }
+    if (perm %% 100 == 0) {
+      cat("\n")
+      print(paste("Permutation", perm, "completed")) }
+  }
+
+  return(perm_diff_results)
+}
+
+
+```
+ 
+# Load data
+```{r Load Data}
+df <- read.csv("your_data.csv")
+
+#outliers +-2.689 SD for each of the 50 nuclei should be already removed
+
+```
+
+# Create group dataframes
+```{r Create group dataframes}
+# Filter data for desired network
+edge_order <- c("LeftPuI", "RightPuI", "LeftPuL", "RightPuL", 
+                "LeftPuA", "RightPuA", "LeftPuM", "RightPuM",
+                "LeftMGN", "RightMGN", "LeftLSg", "RightLSg",
+                 "LeftLGN", "RightLGN",
+
+                "LeftVPL", "RightVPL", 
+                "LeftVLa", "RightVLa", "LeftVLp", "RightVLp",
+                "LeftVM", "RightVM",
+                "LeftVA", "RightVA", "LeftVAmc", "RightVAmc", 
+
+                "LeftLP", "RightLP", "LeftLD", "RightLD", #4
+                "LeftCL", "RightCL", "LeftPc", "RightPc", #5
+                "LeftPf", "RightPf", "LeftCM", "RightCM", #6
+                
+                "LeftMDl", "RightMDl",
+                "LeftMDm", "RightMDm", "LeftRe", "RightRe",
+                 "LeftCeM", "RightCeM", "LeftPt", "RightPt",
+                "LeftAV", "RightAV")
+
+df_brain <- df[, edge_order]
+df_var <- df[, c(1:4)]
+df <- cbind(df_var, df_brain)
+all_brain_data <- df %>% select(LeftPuI:RightAV)
+all_brain_names <- names(all_brain_data)
+
+ptsd_group <- df %>% filter(ptsd_dx == 1)
+ptsd_group_data <- ptsd_group %>% select(all_of(all_brain_names))
+
+control_ptsd_group <- df %>% filter(ptsd_dx == 0)
+control_ptsd_group_data <- control_ptsd_group %>% select(all_of(all_brain_names))
+```
+
+# Create correlation matrices and graph objects for each group
+```{r Correlation matrices}
+library(brainGraph)
+
+ptsd_matrix <- cor(ptsd_group_data)
+abs_ptsd_matrix <- abs(ptsd_matrix)
+ptsd_graph_list <- equal_thresholding_of_matrix(abs_ptsd_matrix)
+ptsd_graph <- graph_from_adjacency_matrix(abs_ptsd_matrix, mode = "undirected", weighted = TRUE, diag = FALSE)
+
+control_ptsd_matrix <- cor(control_ptsd_group_data)
+abs_control_ptsd_matrix <- abs(control_ptsd_matrix)
+control_ptsd_graph_list <- equal_thresholding_of_matrix(abs_control_ptsd_matrix)
+control_ptsd_graph <- graph_from_adjacency_matrix(abs_control_ptsd_matrix, mode = "undirected", weighted = TRUE, diag = FALSE)
+```
+
+# Calculate network properties
+```{r Network properties, warning=FALSE}
+# Graph edge differences
+diff_matrix <- ptsd_matrix - control_ptsd_matrix
+
+ptsd_graph_metrics <- graph_metrics_across_densities(ptsd_graph_list)
+control_ptsd_graph_metrics <- graph_metrics_across_densities(control_ptsd_graph_list)
+ptsd_node_metrics <- node_metrics_across_densities(ptsd_graph_list)
+control_ptsd_node_metrics <- node_metrics_across_densities(control_ptsd_graph_list)
+
+
+# Global measures
+obs_GE_diff <- ptsd_graph_metrics[[1]] - control_ptsd_graph_metrics[[1]] 
+obs_str_diff <- ptsd_graph_metrics[[2]] - control_ptsd_graph_metrics[[2]]  
+obs_mod_diff <- ptsd_graph_metrics[[3]] - control_ptsd_graph_metrics[[3]] 
+
+# Nodal measures
+obs_node_str_diff <- ptsd_node_metrics[,,1] - control_ptsd_node_metrics[,,1]
+rownames(obs_node_str_diff) <- all_brain_names
+obs_node_close_diff <- ptsd_node_metrics[,,2] - control_ptsd_node_metrics[,,2]
+rownames(obs_node_close_diff) <- all_brain_names
+obs_node_eigen_diff <- ptsd_node_metrics[,,3] - control_ptsd_node_metrics[,,3]
+rownames(obs_node_eigen_diff) <- all_brain_names
+obs_node_btwn_diff <- ptsd_node_metrics[,,4] - control_ptsd_node_metrics[,,4]
+rownames(obs_node_btwn_diff) <- all_brain_names
+
+
+ptsd_str <- as.data.frame(ptsd_node_metrics[,,1])
+rownames(ptsd_str) <- all_brain_names
+ptsd_close <- as.data.frame(ptsd_node_metrics[,,2])
+rownames(ptsd_close) <- all_brain_names
+ptsd_eigen <- as.data.frame(ptsd_node_metrics[,,3])
+rownames(ptsd_eigen) <- all_brain_names
+ptsd_btwn <- as.data.frame(ptsd_node_metrics[,,4])
+rownames(ptsd_btwn) <- all_brain_names
+
+control_str <- as.data.frame(control_ptsd_node_metrics[,,1])
+rownames(control_str) <- all_brain_names
+control_close <- as.data.frame(control_ptsd_node_metrics[,,2])
+rownames(control_close) <- all_brain_names
+control_eigen <- as.data.frame(control_ptsd_node_metrics[,,3])
+rownames(control_eigen) <- all_brain_names
+control_btwn <- as.data.frame(control_ptsd_node_metrics[,,4])
+rownames(control_btwn) <- all_brain_names
+
+
+```
+
+# Permutation tests
+```{r Permutation tests, warning=FALSE}
+perm_results_edge_level <- permutation_test_edge_level(100000)
+
+perm_results_node_level <- permutation_test_node_level(5000)
+
+perm_results_graph_level <- permutation_test_graph_level(5000)
+```
+
+# Calculate p-values
+```{r Calculate p-values}
+### Graph Edges ###
+num_nodes <- length(names(all_brain_data))
+index_values <- numeric()
+p_stat_edge_matrix <- array(NA, dim = c(num_nodes, num_nodes))
+# calculate p-values
+for (row in 1:dim(perm_results_edge_level)[1]) {
+  for (col in row:dim(perm_results_edge_level)[2]) {
+    index_values <- perm_results_edge_level[row, col, ]
+    obs_diff <- diff_matrix[row, col]
+    p_stat_edge_matrix[row, col] <- mean(abs(obs_diff) <= abs(index_values))
+  }
+}
+colnames(p_stat_edge_matrix) = names(all_brain_data)
+rownames(p_stat_edge_matrix) = names(all_brain_data)
+
+
+p_stat_edge_matrix <- as.data.frame(p_stat_edge_matrix) %>% 
+  select(intersect(colnames(.), central_intrathal)) %>% 
+  filter(row.names(.) %in% central_intrathal) %>%
+  as.matrix()
+
+# FDR correction
+fdr_corrected_matrix <- array(NA, dim = c(num_nodes, num_nodes))
+fdr_corrected_matrix <- p.adjust(p_stat_edge_matrix, method = "fdr")
+fdr_corrected_matrix <- matrix(fdr_corrected_matrix, nrow = nrow(p_stat_edge_matrix), ncol = ncol(p_stat_edge_matrix))
+colnames(fdr_corrected_matrix) = colnames(p_stat_edge_matrix)
+rownames(fdr_corrected_matrix) = rownames(p_stat_edge_matrix)
+full_fdr_matrix <- fdr_corrected_matrix
+full_fdr_matrix[lower.tri(full_fdr_matrix)] <-
+  t(full_fdr_matrix)[lower.tri(full_fdr_matrix)]
+
+# Print significant p-values
+for (i in 1:nrow(fdr_corrected_matrix)) {
+  for (j in 1:ncol(fdr_corrected_matrix)) {
+    if (!is.na(fdr_corrected_matrix[i, j]) && fdr_corrected_matrix[i, j] < 0.05) {
+      cat(rownames(fdr_corrected_matrix)[i], "--", colnames(fdr_corrected_matrix)[j], "| p-value: ", p_stat_edge_matrix[i,j], "| FDR p-value:", fdr_corrected_matrix[i, j], "\n")
+    }
+  }
+}
+
+```
+
+# Graph level p-values
+```{r}
+p_stat_matrix_GE <- matrix(NA, nrow = 1, ncol = length(num_edges_list))
+p_stat_matrix_str <- matrix(NA, nrow = 1, ncol = length(num_edges_list))
+p_stat_matrix_mod <- matrix(NA, nrow = 1, ncol = length(num_edges_list))
+
+for (i in 1:length(num_edges_list)) {
+  index_values <- perm_results_graph_level[i,,1]
+  p_stat_matrix_GE[i] <- mean(abs(obs_GE_diff[i]) <= abs(index_values))
+  index_values <- perm_results_graph_level[i,,2]
+  p_stat_matrix_str[i] <- mean(abs(obs_str_diff[i]) <= abs(index_values))
+  index_values <- perm_results_graph_level[i,,3]
+  p_stat_matrix_mod[i] <- mean(abs(obs_mod_diff[i]) <= abs(index_values))
+}
+```
+
+# Node level p-values
+```{r}
+p_stat_matrix_node_str <- matrix(NA, nrow = length(names(all_brain_data)), ncol = length(num_edges_list))
+p_stat_matrix_node_close <- matrix(NA, nrow = length(names(all_brain_data)), ncol = length(num_edges_list))
+p_stat_matrix_node_eigen <- matrix(NA, nrow = length(names(all_brain_data)), ncol = length(num_edges_list))
+p_stat_matrix_node_btwn <- matrix(NA, nrow = length(names(all_brain_data)), ncol = length(num_edges_list))
+
+
+for (i in 1:length(num_edges_list)) {
+  index_values1 <- perm_results_node_level[, i, , 1]
+  index_values2 <- perm_results_node_level[, i, , 2]
+  index_values3 <- perm_results_node_level[, i, , 3]
+  index_values4 <- perm_results_node_level[, i, , 4]
+
+  for (row in 1:length(names(all_brain_data))) {
+    
+    # For node strength
+        p_stat_matrix_node_str[row, i] <- mean(abs(obs_node_str_diff[row, i]) <= abs(index_values1[row, ]), na.rm = TRUE)
+
+
+    # For node closeness
+        p_stat_matrix_node_close[row, i] <- mean(abs(obs_node_close_diff[row, i]) <= abs(index_values2[row, ]), na.rm = TRUE)
+
+
+    # For node eigenvector
+    p_stat_matrix_node_eigen[row, i] <- mean(abs(obs_node_eigen_diff[row, i]) <= abs(index_values3[row, ]), na.rm=T)
+
+    # For node betweenness
+    p_stat_matrix_node_btwn[row, i] <- mean(abs(obs_node_btwn_diff[row, i]) <= abs(index_values4[row, ]), na.rm = TRUE)
+
+    
+  }
+}
+
+fdr_matrix_node_str <- matrix(NA, nrow = nrow(p_stat_matrix_node_str), ncol = ncol(p_stat_matrix_node_str))
+fdr_matrix_node_close <- matrix(NA, nrow = nrow(p_stat_matrix_node_close), ncol = ncol(p_stat_matrix_node_close))
+fdr_matrix_node_eigen <- matrix(NA, nrow = nrow(p_stat_matrix_node_eigen), ncol = ncol(p_stat_matrix_node_eigen))
+fdr_matrix_node_btwn <- matrix(NA, nrow = nrow(p_stat_matrix_node_btwn), ncol = ncol(p_stat_matrix_node_btwn))
+
+
+for (i in 1:ncol(p_stat_matrix_node_str)) {
+  p_values <- p_stat_matrix_node_str[, i]
+  fdr_matrix_node_str[, i] <- p.adjust(p_values, method = "fdr")
+  p_values <- p_stat_matrix_node_close[, i]
+  fdr_matrix_node_close[, i] <- p.adjust(p_values, method = "fdr")
+  p_values <- p_stat_matrix_node_eigen[, i]
+  fdr_matrix_node_eigen[, i] <- p.adjust(p_values, method = "fdr")
+  p_values <- p_stat_matrix_node_btwn[, i]
+  fdr_matrix_node_btwn[, i] <- p.adjust(p_values, method = "fdr")
+
+}
+
+rownames(p_stat_matrix_node_str) <- all_brain_names
+rownames(fdr_matrix_node_str) <- all_brain_names
+rownames(p_stat_matrix_node_close) <- all_brain_names
+rownames(fdr_matrix_node_close) <- all_brain_names
+rownames(p_stat_matrix_node_eigen) <- all_brain_names
+rownames(fdr_matrix_node_eigen) <- all_brain_names
+rownames(p_stat_matrix_node_btwn) <- all_brain_names
+rownames(fdr_matrix_node_btwn) <- all_brain_names
+
+```
+
+# Clustering
+```{r}
+library(cluster)
+library(maptree)
+library(proxy)
+library(scales)
+library(ggraph)
+library(ggrepel)
+library(dendextend)
+library(clusteval)
+library(RColorBrewer)
+library(ggthemes)
+library(paletteer)
+library(factoextra)
+library(genieclust)
+
+pearson_dist <- function(data) {
+  as.dist(1 - cor(t(data), method = "pearson"))
+}
+
+# Create left and right hemisphere matrices
+diff_matrix <- read.csv("diff_matrix.csv", row.names = 1)
+tc_diff_matrix <- read.csv("tc_diff_matrix.csv", row.names = 1)
+tc_diff_matrix <- tc_diff_matrix[edge_order, ]
+
+tc_diff_matrix1 <- tc_diff_matrix[!startsWith(rownames(tc_diff_matrix), "Left"), ]
+rownames(tc_diff_matrix1) <- sub("^Right", "", rownames(tc_diff_matrix1))
+
+diff_matrix1 <- diff_matrix[!startsWith(rownames(diff_matrix), "Left"), ]
+rownames(diff_matrix1) <- sub("^Right", "", rownames(diff_matrix1))
+
+tc_diff_matrix2 <- tc_diff_matrix[!startsWith(rownames(tc_diff_matrix), "Right"), ]
+rownames(tc_diff_matrix2) <- sub("^Left", "", rownames(tc_diff_matrix2))
+
+diff_matrix2 <- diff_matrix[!startsWith(rownames(diff_matrix), "Right"), ]
+rownames(diff_matrix2) <- sub("^Left", "", rownames(diff_matrix2))
+
+
+#### Clustering ####
+thal_dist <-pearson_dist(diff_matrix1)
+cx_dist <- pearson_dist(tc_diff_matrix1)
+
+thal_clust <- hclust(thal_dist, method = "average")
+cx_clust <- hclust(cx_dist, method = "average")
+
+op_k <- kgs(thal_clust, diss = thal_dist, maxclus = 25, alpha = 1)
+which.min(op_k)
+op_k2 <- kgs(cx_clust, diss = cx_dist, maxclus = 25, alpha = 1)
+which.min(op_k2)
+
+thal_cluster_assignments <- cutree(thal_clust, k = which.min(op_k)+1)
+cx_cluster_assignments <- cutree(cx_clust, k = which.min(op_k2)+1)
+
+dend_thal <- as.dendrogram(thal_clust)
+dend_cx <- as.dendrogram(cx_clust)
+
+dend_list <- dendlist(dend_thal, dend_cx)
+
+cor_cophenetic(dend_list)
+cor(cx_dist,cophenetic(cx_clust))
+```
+
+
+
+#############################
+# Thalamo-Cortical Analysis #
+#############################
+
+
+# Load packages and initialize functions
+```{r Initialize functions}
+library(dplyr)
+library(ggplot2)
+library(ggcorrplot)
+library(tidyr)
+
+# Initialize functions
+num_edges_list <- c(0, 0.025, 0.05, 0.075, 0.1)
+
+equal_thresholding_of_matrix <- function(matrix) {
+  num_edges_list <- c()
+  graph_list <- list()
+  threshold_values <- c(0, 0.025, 0.05, 0.075, 0.1)
+  for (i in threshold_values) {
+    
+    matrix[matrix < i] <- 0
+    graph <- graph_from_adjacency_matrix(matrix, mode = "undirected", weighted = TRUE, diag = FALSE)
+    graph_list[[length(graph_list) + 1]] <- graph
+  }
+  return(graph_list)
+}
+
+graph_metrics_across_densities <- function(graph_list) {
+  
+  glob_eff_list <- numeric(length(graph_list))
+  avg_str_list <- numeric(length(graph_list))
+  mod_list <- numeric(length(graph_list))
+  
+  for (i in 1:length(graph_list)) {
+    inv_graph <- graph_list[[i]]
+    E(inv_graph)$weight <- 1 / E(inv_graph)$weight
+    
+    glob_eff_list[i] <- efficiency(inv_graph, type = "global")
+    avg_str_list[i] <- mean(strength(graph_list[[i]], mode = "all"))
+    
+    community <- cluster_louvain(graph_list[[i]])
+    membership <- membership(community)
+    mod_list[i] <- modularity(graph_list[[i]],
+                              membership = membership,
+                              weights = E(graph_list[[i]])$weight)
+  }
+  graph_metrics_list <- c(list(glob_eff_list), list(avg_str_list), list(mod_list))
+                          
+  return(graph_metrics_list)
+}
+
+node_metrics_across_densities <- function(graph_list) {
+  num_nodes <- vcount(graph_list[[1]]) 
+  num_graphs <- length(graph_list)
+  num_measures <- 4
+  
+  graph_metrics_list <- array(NA, dim = c(num_nodes, num_graphs, num_measures))
+  
+  node_str_list <- list()
+  close_cen_list <- list()
+  eigen_cen_list <- list()
+  btwn_cen_list <- list()
+
+  for (i in 1:num_graphs) {
+    inv_graph <- graph_list[[i]]
+    E(inv_graph)$weight <- 1 / E(inv_graph)$weight
+
+    node_str_list[[i]] <- strength(graph_list[[i]], mode = "all")
+    close_cen_list[[i]] <- closeness(inv_graph, mode = "all")
+    eigen_cen_list[[i]] <- eigen_centrality(graph_list[[i]])$vector
+    btwn_cen_list[[i]] <- betweenness(inv_graph, directed = FALSE, 
+                            weights = inv_graph$weight)
+
+  }
+  
+  # Convert lists to matrices
+  node_str_matrix <- do.call(cbind, lapply(node_str_list, as.numeric))
+  close_cen_matrix <- do.call(cbind, lapply(close_cen_list, as.numeric))
+  eigen_cen_matrix <- do.call(cbind, lapply(eigen_cen_list, as.numeric))
+  btwn_cen_matrix <- do.call(cbind, lapply(btwn_cen_list, as.numeric))
+ 
+  # Reshape matrices to fit the array dimensions
+  for (i in 1:num_graphs) {
+    graph_metrics_list[,i,1] <- matrix(node_str_matrix[,i], nrow = num_nodes)
+    graph_metrics_list[,i,2] <- matrix(close_cen_matrix[,i], nrow = num_nodes)
+    graph_metrics_list[,i,3] <- matrix(eigen_cen_matrix[,i], nrow = num_nodes)
+    graph_metrics_list[,i,4] <- matrix(btwn_cen_matrix[,i], nrow = num_nodes)
+
+  }
+  return(graph_metrics_list)
+}
+
+permutation_test_edge_level <- function(n_permutations = 1000, brain_var = all_brain_names) {
+  num_nodes <- length(brain_var)
+  perm_edge_diff_matrices <- array(NA, dim = c(50, 68, n_permutations))
+  
+  for (perm in 1:n_permutations) {
+    perm_df <- df
+    shuffled_labels <- sample(perm_df$ptsd_dx, replace = FALSE)
+    perm_df$ptsd_dx <- shuffled_labels
+    perm_ptsd_data <- perm_df %>% filter(ptsd_dx == 1)
+    perm_ptsd_data <- perm_ptsd_data %>% mutate(cluster = kmc$cluster) %>% filter (cluster == 1) %>% select(all_of(brain_var))
+    perm_control_ptsd_data <- perm_df %>% filter(ptsd_dx == 0) %>% select(all_of(brain_var))
+    
+    perm_ptsd_matrix <- cor(perm_ptsd_data)
+    perm_ptsd_matrix <- perm_ptsd_matrix[69:118, 1:68]
+
+    perm_control_ptsd_matrix <- cor(perm_control_ptsd_data)
+    perm_control_ptsd_matrix <- perm_control_ptsd_matrix[69:118, 1:68]
+
+    perm_edge_diff_matrix <- perm_ptsd_matrix - perm_control_ptsd_matrix
+    perm_edge_diff_matrices[,,perm] <- perm_edge_diff_matrix
+    
+    if (perm %% 100 == 0) {
+       cat(".") }
+    if (perm %% 1000 == 0) {
+      cat("\n")
+      cat(paste("Permutation", perm, "completed\n")) }
+  }
+  return(perm_edge_diff_matrices)
+}
+
+permutation_test_graph_level <- function(n_permutations = 1000, brain_var = all_brain_names) {
+  perm_df <- df
+  num_graph_results <- 4
+  
+  perm_GE_diff_matrices <- array(NA, dim = c(length(num_edges_list), n_permutations))
+  perm_str_diff_matrices <- array(NA, dim = c(length(num_edges_list), n_permutations))
+  perm_mod_diff_matrices <- array(NA, dim = c(length(num_edges_list), n_permutations))
+
+  perm_diff_results <- array(NA, dim = c(length(num_edges_list), n_permutations, num_graph_results))
+
+  for (perm in 1:n_permutations) {
+  
+    shuffled_labels <- sample(perm_df$ptsd_dx, replace = FALSE)
+    perm_df$ptsd_dx <- shuffled_labels
+    perm_ptsd_data <- perm_df %>% filter(ptsd_dx == 1) %>% select(all_of(brain_var))
+    perm_control_ptsd_data <- perm_df %>% filter(ptsd_dx == 0) %>% select(all_of(brain_var))
+    
+    perm_ptsd_matrix <- abs(cor(perm_ptsd_data))
+    perm_ptsd_matrix[1:68, 1:68] <- 0
+    perm_ptsd_matrix[69:118, 69:118] <- 0
+    
+    perm_control_ptsd_matrix <- abs(cor(perm_control_ptsd_data))
+    perm_control_ptsd_matrix[1:68, 1:68] <- 0
+    perm_control_ptsd_matrix[69:118, 69:118] <- 0
+    
+    perm_ptsd_graph_list <- equal_thresholding_of_matrix(perm_ptsd_matrix)
+    perm_control_ptsd_graph_list <- equal_thresholding_of_matrix(perm_control_ptsd_matrix)
+    
+    perm_ptsd_metrics <- graph_metrics_across_densities(perm_ptsd_graph_list)
+    perm_control_ptsd_metrics <- graph_metrics_across_densities(perm_control_ptsd_graph_list)
+    
+    perm_GE_diff_matrices[, perm] <- perm_ptsd_metrics[[1]] - perm_control_ptsd_metrics[[1]]
+    perm_str_diff_matrices[, perm] <- perm_ptsd_metrics[[2]] - perm_control_ptsd_metrics[[2]]
+    perm_mod_diff_matrices[, perm] <- perm_ptsd_metrics[[3]] - perm_control_ptsd_metrics[[3]]
+
+    
+    if (perm %% 1 == 0) {
+       cat(".") }
+    if (perm %% 100 == 0) {
+      cat("\n")
+      cat(paste("Permutation", perm, "completed\n")) }
+  }
+  perm_diff_results[,,1] <- perm_GE_diff_matrices
+  perm_diff_results[,,2] <- perm_str_diff_matrices
+  perm_diff_results[,,3] <- perm_mod_diff_matrices
+
+  return(perm_diff_results)
+}
+
+
+permutation_test_node_level <- function(n_permutations = 1000, brain_var = all_brain_names) {
+  num_nodes <- length(brain_var)
+  num_graphs <- length(num_edges_list)
+  num_results <- 4 
+  
+  perm_diff_results <- array(NA, dim = c(num_nodes, num_graphs, n_permutations, num_results))
+  
+  for (perm in 1:n_permutations) {
+    
+    perm_df <- df
+    shuffled_labels <- sample(perm_df$ptsd_dx, replace = FALSE)
+    perm_df$ptsd_dx <- shuffled_labels
+    perm_ptsd_data <- perm_df %>% filter(ptsd_dx == 1) 
+    perm_ptsd_data <- perm_ptsd_data %>% mutate(cluster = kmc$cluster) %>% filter (cluster == 1) %>% select(all_of(brain_var))
+    perm_control_ptsd_data <- perm_df %>% filter(ptsd_dx == 0) %>% select(all_of(brain_var))
+    
+    perm_ptsd_matrix <- abs(cor(perm_ptsd_data))
+    perm_ptsd_matrix[1:68, 1:68] <- 0
+    perm_ptsd_matrix[69:118, 69:118] <- 0
+
+    perm_control_ptsd_matrix <- abs(cor(perm_control_ptsd_data))
+    perm_control_ptsd_matrix[1:68, 1:68] <- 0
+    perm_control_ptsd_matrix[69:118, 69:118] <- 0
+
+    perm_ptsd_graph_list <- equal_thresholding_of_matrix(perm_ptsd_matrix)
+    perm_control_ptsd_graph_list <- equal_thresholding_of_matrix(perm_control_ptsd_matrix)
+    
+    perm_ptsd_metrics <- node_metrics_across_densities(perm_ptsd_graph_list)
+    perm_control_ptsd_metrics <- node_metrics_across_densities(perm_control_ptsd_graph_list)
+    
+    perm_diff_results[, , perm ,] <- perm_ptsd_metrics - perm_control_ptsd_metrics
+    
+    if (perm %% 1 == 0) { cat(".")}
+    if (perm %% 100 == 0) {
+      cat(paste("\nPermutation", perm, "completed")) }
+  }
+
+  return(perm_diff_results)
+}
+
+
+```
+
+# Load data
+```{r}
+df <- read.csv("your_data.csv")
+
+#outliers +-2.689 SD should be already removed
+```
+
+# Create group dataframes
+```{r}
+# Filter data for desired network
+#all_brain_data <- df %>% select(Left.Caudate:RightLD)
+all_brain_data <- df %>% select(R_bankssts:RightLD)
+
+all_brain_names <- names(all_brain_data)
+
+ptsd_group <- df %>% filter(ptsd_dx == 1)
+ptsd_group <- ptsd_group %>% mutate(cluster = kmc$cluster) %>% filter (cluster == 1)
+ptsd_group_data <- ptsd_group %>% select(all_of(all_brain_names))
+
+control_ptsd_group <- df %>% filter(ptsd_dx == 0)
+control_ptsd_group_data <- control_ptsd_group %>% select(all_of(all_brain_names))
+```
+
+# Create correlation matrices and graph objects for each group
+```{r}
+library(brainGraph)
+ptsd_matrix <- cor(ptsd_group_data)
+abs_ptsd_matrix <- abs(ptsd_matrix)
+
+abs_ptsd_matrix[1:68, 1:68] <- 0
+abs_ptsd_matrix[69:118, 69:118] <- 0
+
+ptsd_graph_list <- equal_thresholding_of_matrix(abs_ptsd_matrix)
+ptsd_graph <- graph_from_adjacency_matrix(abs_ptsd_matrix, mode = "undirected", weighted = TRUE, diag = FALSE)
+
+control_ptsd_matrix <- cor(control_ptsd_group_data)
+abs_control_ptsd_matrix <- abs(control_ptsd_matrix)
+
+abs_control_ptsd_matrix[1:68, 1:68] <- 0
+abs_control_ptsd_matrix[69:118, 69:118] <- 0
+
+control_ptsd_graph_list <- equal_thresholding_of_matrix(abs_control_ptsd_matrix)
+control_ptsd_graph <- graph_from_adjacency_matrix(abs_control_ptsd_matrix, mode = "undirected", weighted = TRUE, diag = FALSE)
+
+
+```
+
+# Calculate network properties
+```{r Network properties}
+# Graph edge differences
+diff_matrix <- ptsd_matrix - control_ptsd_matrix
+
+ptsd_graph_metrics <- graph_metrics_across_densities(ptsd_graph_list)
+control_ptsd_graph_metrics <- graph_metrics_across_densities(control_ptsd_graph_list)
+ptsd_node_metrics <- node_metrics_across_densities(ptsd_graph_list)
+control_ptsd_node_metrics <- node_metrics_across_densities(control_ptsd_graph_list)
+
+# Global measures
+obs_GE_diff <- ptsd_graph_metrics[[1]] - control_ptsd_graph_metrics[[1]]
+obs_str_diff <- ptsd_graph_metrics[[2]] - control_ptsd_graph_metrics[[2]]
+obs_mod_diff <- ptsd_graph_metrics[[3]] - control_ptsd_graph_metrics[[3]]
+
+# Nodal measures
+obs_node_str_diff <- ptsd_node_metrics[,,1] - control_ptsd_node_metrics[,,1]
+rownames(obs_node_str_diff) <- all_brain_names
+obs_node_close_diff <- ptsd_node_metrics[,,2] - control_ptsd_node_metrics[,,2]
+rownames(obs_node_close_diff) <- all_brain_names
+obs_node_eigen_diff <- ptsd_node_metrics[,,3] - control_ptsd_node_metrics[,,3]
+rownames(obs_node_eigen_diff) <- all_brain_names
+obs_node_btwn_diff <- ptsd_node_metrics[,,4] - control_ptsd_node_metrics[,,4]
+rownames(obs_node_btwn_diff) <- all_brain_names
+
+ptsd_str <- as.data.frame(ptsd_node_metrics[,,1])
+rownames(ptsd_str) <- all_brain_names
+ptsd_close <- as.data.frame(ptsd_node_metrics[,,2])
+rownames(ptsd_close) <- all_brain_names
+ptsd_eigen <- as.data.frame(ptsd_node_metrics[,,3])
+rownames(ptsd_eigen) <- all_brain_names
+ptsd_btwn <- as.data.frame(ptsd_node_metrics[,,4])
+rownames(ptsd_btwn) <- all_brain_names
+
+control_str <- as.data.frame(control_ptsd_node_metrics[,,1])
+rownames(control_str) <- all_brain_names
+control_close <- as.data.frame(control_ptsd_node_metrics[,,2])
+rownames(control_close) <- all_brain_names
+control_eigen <- as.data.frame(control_ptsd_node_metrics[,,3])
+rownames(control_eigen) <- all_brain_names
+control_btwn <- as.data.frame(control_ptsd_node_metrics[,,4])
+rownames(control_btwn) <- all_brain_names
+```
+
+# Permutation test
+```{r}
+perm_results_edge_level <- permutation_test_edge_level(100000)
+
+perm_results_node_level <- permutation_test_node_level(5000)
+
+perm_results_graph_level <- permutation_test_graph_level(5000)
+
+```
+
+# Calculate p-values
+```{r}
+### Graph Edges ###
+filt_diff_matrix <- diff_matrix[69:118, 1:68]
+
+num_nodes <- length(names(all_brain_data))
+index_values <- numeric()
+p_stat_edge_matrix <- array(NA, dim = c(dim(perm_results_edge_level)[1],
+                                        dim(perm_results_edge_level)[2]))
+# calculate p-values
+for (row in 1:dim(perm_results_edge_level)[1]) {
+  for (col in 1:dim(perm_results_edge_level)[2]) {
+    index_values <- perm_results_edge_level[row, col, ]
+    obs_diff <- filt_diff_matrix[row, col]
+    p_stat_edge_matrix[row, col] <- mean(abs(obs_diff) <= abs(index_values))
+  }
+}
+colnames(p_stat_edge_matrix) = names(all_brain_data)
+rownames(p_stat_edge_matrix) = names(all_brain_data)
+
+colnames(p_stat_edge_matrix) = colnames(filt_diff_matrix)
+rownames(p_stat_edge_matrix) = rownames(filt_diff_matrix)
+
+p_stat_edge_matrix_modified <- as.data.frame(p_stat_edge_matrix) %>% 
+  filter(row.names(.) %in% central_thal) %>%
+  as.matrix()
+
+# FDR correction
+fdr_corrected_matrix <- array(NA, dim = c(nrow(p_stat_edge_matrix_modified), ncol(p_stat_edge_matrix)))
+fdr_corrected_matrix <- p.adjust(as.matrix(p_stat_edge_matrix_modified), method = "fdr")
+fdr_corrected_matrix <- matrix(fdr_corrected_matrix, 
+                               nrow = nrow(p_stat_edge_matrix_modified), 
+                               ncol = ncol(p_stat_edge_matrix))
+colnames(fdr_corrected_matrix) = colnames(p_stat_edge_matrix)
+rownames(fdr_corrected_matrix) = rownames(p_stat_edge_matrix_modified)
+
+# Print significant p-values
+for (i in 1:nrow(fdr_corrected_matrix)) {
+  for (j in 1:ncol(fdr_corrected_matrix)) {
+    if (!is.na(fdr_corrected_matrix[i, j]) && fdr_corrected_matrix[i, j] < 0.05) {
+      cat(rownames(fdr_corrected_matrix)[i], "--", colnames(fdr_corrected_matrix)[j], "| p-value: ", p_stat_edge_matrix_modified[i,j], "| FDR p-value:", fdr_corrected_matrix[i, j], "\n")
+    }
+  }
+}
+
+```
+
+# Graph level p-values
+```{r}
+p_stat_matrix_GE <- matrix(NA, nrow = 1, ncol = length(num_edges_list))
+p_stat_matrix_str <- matrix(NA, nrow = 1, ncol = length(num_edges_list))
+p_stat_matrix_mod <- matrix(NA, nrow = 1, ncol = length(num_edges_list))
+
+for (i in 1:length(num_edges_list)) {
+  index_values <- perm_results_graph_level[i,,1]
+  p_stat_matrix_GE[i] <- mean(abs(obs_GE_diff[i]) <= abs(index_values))
+  index_values <- perm_results_graph_level[i,,2]
+  p_stat_matrix_str[i] <- mean(abs(obs_str_diff[i]) <= abs(index_values))
+  index_values <- perm_results_graph_level[i,,3]
+  p_stat_matrix_mod[i] <- mean(abs(obs_mod_diff[i]) <= abs(index_values))
+}
+
+```
+
+# Node level p-values
+```{r}
+p_stat_matrix_node_str <- matrix(NA, nrow = length(names(all_brain_data)), ncol = length(num_edges_list))
+p_stat_matrix_node_close <- matrix(NA, nrow = length(names(all_brain_data)), ncol = length(num_edges_list))
+p_stat_matrix_node_eigen <- matrix(NA, nrow = length(names(all_brain_data)), ncol = length(num_edges_list))
+p_stat_matrix_node_btwn <- matrix(NA, nrow = length(names(all_brain_data)), ncol = length(num_edges_list))
+
+
+for (i in 1:length(num_edges_list)) {
+  index_values1 <- perm_results_node_level[, i, , 1]
+  index_values2 <- perm_results_node_level[, i, , 2]
+  index_values3 <- perm_results_node_level[, i, , 3]
+  index_values4 <- perm_results_node_level[, i, , 4]
+
+  for (row in 1:length(names(all_brain_data))) {
+    
+    # For node strength
+        p_stat_matrix_node_str[row, i] <- mean(abs(obs_node_str_diff[row, i]) <= abs(index_values1[row, ]), na.rm = TRUE)
+
+
+    # For node closeness
+        p_stat_matrix_node_close[row, i] <- mean(abs(obs_node_close_diff[row, i]) <= abs(index_values2[row, ]), na.rm = TRUE)
+
+
+    # For node eigenvector
+    p_stat_matrix_node_eigen[row, i] <- mean(abs(obs_node_eigen_diff[row, i]) <= abs(index_values3[row, ]), na.rm=T)
+
+    # For node betweenness
+    p_stat_matrix_node_btwn[row, i] <- mean(abs(obs_node_btwn_diff[row, i]) <= abs(index_values4[row, ]), na.rm = TRUE)
+
+    
+  }
+}
+
+
+fdr_matrix_node_str <- matrix(NA, nrow = nrow(p_stat_matrix_node_str), ncol = ncol(p_stat_matrix_node_str))
+fdr_matrix_node_close <- matrix(NA, nrow = nrow(p_stat_matrix_node_close), ncol = ncol(p_stat_matrix_node_close))
+fdr_matrix_node_eigen <- matrix(NA, nrow = nrow(p_stat_matrix_node_eigen), ncol = ncol(p_stat_matrix_node_eigen))
+fdr_matrix_node_btwn <- matrix(NA, nrow = nrow(p_stat_matrix_node_btwn), ncol = ncol(p_stat_matrix_node_btwn))
+
+
+for (i in seq_len(ncol(p_stat_matrix_node_str))) {
+  # Adjust p-values for p_stat_matrix_node_str
+  p_values <- p_stat_matrix_node_str[, i]
+  adjusted_values <- p.adjust(p_values[69:118], method = "fdr")
+  fdr_matrix_node_str[69:118, i] <- adjusted_values
+
+  # Adjust p-values for p_stat_matrix_node_close
+  p_values <- p_stat_matrix_node_close[, i]
+  adjusted_values <- p.adjust(p_values[69:118], method = "fdr")
+  fdr_matrix_node_close[69:118, i] <- adjusted_values
+
+  # Adjust p-values for p_stat_matrix_node_eigen
+  p_values <- p_stat_matrix_node_eigen[, i]
+  adjusted_values <- p.adjust(p_values[69:118], method = "fdr")
+  fdr_matrix_node_eigen[69:118, i] <- adjusted_values
+
+  # Adjust p-values for p_stat_matrix_node_btwn
+  p_values <- p_stat_matrix_node_btwn[, i]
+  adjusted_values <- p.adjust(p_values[69:118], method = "fdr")
+  fdr_matrix_node_btwn[69:118, i] <- adjusted_values
+}
+
+rownames(p_stat_matrix_node_str) <- all_brain_names
+rownames(fdr_matrix_node_str) <- all_brain_names
+rownames(p_stat_matrix_node_close) <- all_brain_names
+rownames(fdr_matrix_node_close) <- all_brain_names
+rownames(p_stat_matrix_node_eigen) <- all_brain_names
+rownames(fdr_matrix_node_eigen) <- all_brain_names
+rownames(p_stat_matrix_node_btwn) <- all_brain_names
+rownames(fdr_matrix_node_btwn) <- all_brain_names
+
+```
